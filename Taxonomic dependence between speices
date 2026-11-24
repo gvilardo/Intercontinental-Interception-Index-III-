@@ -1,0 +1,393 @@
+##### Taxonomic dependence######
+
+# Taxonomic tree, taxonomic distance and dependence 
+
+install.packages(c("ape", "phytools"))
+library(ape)
+library(readxl)
+library(phytools)
+library (tidyverse)
+
+set.seed(1)                                   # reproducibility
+dir.create("output_filogenia", showWarnings = FALSE)
+
+# ---- Taxonomic data ----------------------------------------------------
+
+tax <- as.data.frame(Taxonomy)
+tax<-tax %>% select(-Tribe)
+names(tax) <- c("Subfamily", "Tribe", "Genus", "Species")
+tax[] <- lapply(tax, function(x) trimws(as.character(x)))
+
+# Consistence Controls 
+stopifnot(all(sub(" .*", "", tax$Species) == tax$Genus))      # gender match with bonomio
+gen_multi <- tapply(tax$Tribe, tax$Genus, function(x) length(unique(x)))
+if (any(gen_multi > 1)) warning("Genders in more than one tribe: ",
+                                paste(names(gen_multi)[gen_multi > 1], collapse = ", "))
+
+tax$tip <- gsub(" ", "_", tax$Species)                          # names of the species
+
+tax[] <- lapply(tax, factor)
+rownames(tax) <- tax$tip
+cat("Species:", nrow(tax), "| Genders:", nlevels(tax$Genus),
+    "| Tribes:", nlevels(tax$Tribe), "| Subfamilys:", nlevels(tax$Subfamily), "\n")
+
+# ---- Taxonomic tree with Grafen branches  --------------------------------
+# Subfamily > Tribe > Gender > Specie; each group is a polytomies.
+tr <- as.phylo(~Subfamily/Tribe/Genus/tip, data = tax, collapse = FALSE)
+tr <- collapse.singles(tr)                    # remove nods with only one son
+tr <- compute.brlen(tr, method = "Grafen", power = 1)
+stopifnot(is.ultrametric(tr), Ntip(tr) == nrow(tax))
+tr$tip.label <- as.character(tr$tip.label)
+write.tree(tr, "output_filogenia/arbol_taxonomico_Grafen.nwk")
+
+# ---- Distance, covariance and axes PCoA -------------------------------------
+D <- cophenetic(tr)                           # taxonomic distance by peers
+A <- vcv(tr, corr = TRUE)                     # taxonomic covariance (for random effect)
+write.csv(D, "output_filogenia/distancia_filogenetica.csv")
+write.csv(A, "output_filogenia/covarianza_filogenetica.csv")
+
+pc <- pcoa(D)                                 # ape::pcoa (without correlation: la matriz es euclídea/ultramétrica)
+n_ejes <- min(50, ncol(pc$vectors))
+E <- as.data.frame(pc$vectors[, 1:n_ejes])
+colnames(E) <- paste0("PCoA", seq_len(n_ejes))
+write.csv(E, "output_filogenia/ejes_filogeneticos_PCoA.csv")
+varexp <- pc$values$Relative_eig
+cat("Cummulative variance (5/10/20 axes):",
+    round(cumsum(varexp)[c(5, 10, 20)], 3), "\n")
+
+# ----  100 possible results of polytomies ----------------------------
+# To check if the results depends on the particular taxonomic tree
+n_rep  <- 100
+trees  <- replicate(n_rep,
+                    compute.brlen(multi2di(tr, random = TRUE), method = "Grafen"),
+                    simplify = FALSE)
+class(trees) <- "multiPhylo"
+
+# ----  Taxonomic tree plot --------------------------------------------------------
+pdf("output_filogenia/arbol_taxonomico.pdf", width = 8, height = 28)
+plot(tr, cex = 0.35, label.offset = 0.01, no.margin = TRUE)
+dev.off()
+
+
+####### Taxonomic correlation signal in the model residual######
+# Objective: To evaluate whether residuals from the original linear model show taxonomic  autocorrelation among bark and ambrosia beetle species.
+
+# Original model:
+# log(Prop_press) ~ Feeding_Haack + Host_taxa + Host_breadth + N_regions
+
+# ---- Load packages --------------------------------------------------------
+
+library(dplyr)
+library(ape)
+library(phytools)
+library(nlme)
+library(car)
+
+set.seed(1)
+
+
+# ---- Prepare data ---------------------------------------------------------
+
+# Load the original dataset
+datos <- as.data.frame(Presion_propagulos_publicacion)
+
+
+# Convert character strings "NA" into actual missing values
+datos <- datos %>%
+  mutate(across(where(is.character), ~ na_if(.x, "NA")))
+
+# Create the species tip labels from the Species column
+# Spaces are replaced with underscores to match the tree labels
+datos$tip <- gsub(" ", "_", trimws(as.character(datos$Specie)))
+
+# Exclude widespread species and species classified as "oth"
+datos <- datos %>%
+  filter(
+    !is.na(Native_reg),
+    Native_reg != "widespread",
+    !is.na(Feeding_Haack),
+    Feeding_Haack != "oth"
+  )
+
+# Define the original model formula
+formula_mod <- log(Prop_press) ~ Feeding_Haack +
+  Host_taxa + Host_breadth + as.numeric(N_regions)
+
+# Exclude observations with missing values in model variables
+# Also exclude non-positive values of Prop_press
+datos <- datos %>%
+  filter(Prop_press > 0) %>%
+  filter(complete.cases(select(., all_of(c(
+    "Prop_press", "Feeding_Haack", "Host_taxa",
+    "Host_breadth", "N_regions", "tip"
+  )))))
+
+# Check that each species occurs only once
+if (anyDuplicated(datos$tip)) {
+  stop("There are duplicated species names in the dataset.")
+}
+
+# Assign species names as row names
+rownames(datos) <- datos$tip
+
+cat("Number of species in the dataset:", nrow(datos), "\n")
+
+
+# ---- Load and prune the taxonomic tree -------------------------------
+
+# Load the Taxonomic  tree
+tr_full <- read.tree("output_filogenia/arbol_taxonomico_Grafen.nwk")
+
+# Standardize tree tip labels
+tr_full$tip.label <- gsub(" ", "_", trimws(tr_full$tip.label))
+
+# Check for duplicated tip labels
+if (anyDuplicated(tr_full$tip.label)) {
+  stop("The Taxonomic  tree contains duplicated tip labels.")
+}
+
+# Check whether all species in the dataset are present in the tree
+species_missing <- setdiff(datos$tip, tr_full$tip.label)
+
+if (length(species_missing) > 0) {
+  stop(
+    "The following species are missing from the tree: ",
+    paste(species_missing, collapse = ", ")
+  )
+}
+
+# Prune the tree to retain only species included in the model
+tr <- keep.tip(tr_full, datos$tip)
+
+# Reorder the dataset according to the tree tip labels
+datos <- datos[match(tr$tip.label, datos$tip), ]
+
+# Ensure that the data and tree have the same species order
+stopifnot(all(datos$tip == tr$tip.label))
+
+cat("Number of species in the pruned tree:", length(tr$tip.label), "\n")
+
+
+# ---- Fit the original linear model ---------------------------------------
+
+# Fit the original model without Taxonomic  correction
+modelo <- lm(
+  formula_mod,
+  data = datos,
+  na.action = na.fail
+)
+
+# Model summary
+summary(modelo)
+
+# ---- Extract and match model residuals -----------------------------------
+
+# Extract Pearson residuals
+res <- residuals(modelo, type = "pearson")
+
+# Associate each residual with its corresponding species
+names(res) <- datos$tip
+
+# Reorder residuals according to the Taxonomic  tree
+res <- res[tr$tip.label]
+
+# Check that residuals and tree tips match
+stopifnot(
+  length(res) == length(tr$tip.label),
+  !anyNA(res),
+  identical(names(res), tr$tip.label)
+)
+
+# ---- Taxonomic  Moran's I ----------------------------------------------
+
+# Function to calculate Taxonomic  Moran's I
+# Weights are defined as the inverse of Taxonomic  distances
+
+moran_filo <- function(res, arbol) {
+  
+  Dm <- cophenetic(arbol)[names(res), names(res)]
+  
+  W <- 1 / Dm
+  diag(W) <- 0
+  
+  result <- Moran.I(res, weight = W)
+  
+  c(
+    I = result$observed,
+    expected = result$expected,
+    p = result$p.value
+  )
+}
+
+# Calculate Moran's I using the original tree
+cat("\nTaxonomic  Moran's I (original tree):\n")
+
+moran_original <- moran_filo(res, tr)
+
+print(moran_original)
+
+#The result suggests that closely related species on the tree tend to exhibit residues that are somewhat more similar to one another than would be expected by chance. There may be a taxonomic structure remaining in the variation of Prop_press that the model—based on species traits—is not fully capturing.
+
+# ---- Sensitivity analysis: random resolution of polytomies ---------------
+
+# Randomly resolve polytomies and assign Grafen branch lengths
+# Repeat the analysis across multiple alternative trees
+
+n_rep <- 100
+
+trees <- replicate(
+  n_rep,
+  compute.brlen(
+    multi2di(tr, random = TRUE),
+    method = "Grafen"
+  ),
+  simplify = FALSE
+)
+
+# Calculate Moran's I for each alternative tree
+out <- t(
+  sapply(
+    trees,
+    function(tt) moran_filo(res, tt)
+  )
+)
+
+# Summarize results across alternative trees
+cat("\nTaxonomic  Moran's I across", n_rep, "alternative trees:\n")
+
+print(
+  c(
+    I_median = median(out[, "I"]),
+    p_median = median(out[, "p"]),
+    p_min = min(out[, "p"]),
+    p_max = max(out[, "p"]),
+    proportion_p_below_0.05 = mean(out[, "p"] < 0.05)
+  )
+)
+
+#Taxonomic  Moran's I indicated weak positive autocorrelation in model residuals under the original tree topology (I = 0.026, p = 0.036). However, this pattern was not robust to alternative resolutions of polytomies: only 20% of 100 randomly resolved trees yielded significant autocorrelation (p < 0.05), suggesting that the evidence for residual Taxonomic  structure was sensitive to tree topology.
+
+# ----  Pagel's lambda of model residuals -----------------------------------
+
+# Estimate Taxonomic  signal in model residuals using Pagel's lambda
+
+cat("\nPagel's lambda for model residuals:\n")
+
+lambda_res <- phylosig(
+  tr,
+  res,
+  method = "lambda",
+  test = TRUE
+)
+
+print(lambda_res)
+
+#no encontramos evidencia de señal filogenética en los residuos según el análisis de Pagel's lambda.
+
+# ---- Taxonomic  generalized least squares (PGLS) -----------------------
+
+# Fit PGLS models across a grid of fixed Pagel's lambda values.
+# Lambda = 0 corresponds to no taxonomic  correlation.
+# Larger values indicate stronger taxonomic  correlation.
+
+ajusta_lambda <- function(l) {
+  
+  gls(
+    formula_mod,
+    data = datos,
+    method = "ML",
+    correlation = corPagel(
+      value = l,
+      phy = tr,
+      form = ~ tip,
+      fixed = TRUE
+    ),
+    na.action = na.fail
+  )
+}
+
+# Explore lambda values between 0 and 1
+grilla <- seq(0, 1, by = 0.01)
+
+# Fit models for each lambda value
+ajustes <- lapply(grilla, ajusta_lambda)
+
+# Extract maximum likelihood values
+ll <- sapply(ajustes, logLik)
+
+# Identify the lambda value with the highest likelihood
+lambda_hat <- grilla[which.max(ll)]
+
+# Select the best-fitting PGLS model
+pgls <- ajustes[[which.max(ll)]]
+
+# Select the model with lambda = 0
+sin_fil <- ajustes[[1]]
+
+cat("\nEstimated Pagel's lambda:", lambda_hat, "\n")
+
+#El modelo encuentra que incorporar la estructura de covarianza filogenética no mejora el ajuste respecto de un modelo sin correlación filogenética residual.
+
+
+# ----  Compare models -------------------------------------------------------
+
+# Likelihood ratio statistic comparing lambda = 0 with the best-fitting model
+
+lrt <- 2 * (max(ll) - ll[1])
+
+# Approximate p-value accounting for lambda = 0 being a boundary value
+p_lrt <- 0.5 * pchisq(lrt, df = 1, lower.tail = FALSE)
+
+cat(
+  "\nLikelihood ratio test (lambda = 0 vs. estimated lambda):\n",
+  "LRT =", round(lrt, 3),
+  "| approximate p =", signif(p_lrt, 3), "\n"
+)
+
+# Compare AIC and log-likelihood
+comparison <- data.frame(
+  model = c(
+    "No taxonomic correlation (lambda = 0)",
+    paste0("PGLS (lambda = ", lambda_hat, ")")
+  ),
+  AIC = c(AIC(sin_fil), AIC(pgls)),
+  logLik = c(as.numeric(logLik(sin_fil)),
+             as.numeric(logLik(pgls)))
+)
+
+print(comparison)
+
+
+# ---- Compare model coefficients -----------------------------------------
+
+# Compare coefficients from the original model and PGLS
+
+coef_comparison <- data.frame(
+  no_phylogeny = coef(sin_fil),
+  with_phylogeny = coef(pgls)
+)
+
+cat("\nComparison of model coefficients:\n")
+
+print(round(coef_comparison, 3))
+
+#No diference between coefficients
+
+
+# ------Plot the likelihood profile ----------------------------------------
+
+plot(
+  grilla,
+  ll,
+  type = "b",
+  xlab = expression(lambda),
+  ylab = "Log-likelihood (ML)",
+  main = "Profile likelihood for Pagel's lambda"
+)
+
+abline(
+  v = lambda_hat,
+  lty = 2
+)
+
+#In our case, the best model fit occurs when lambda estimated == 0 (model without taxonomic correlation). Greater values of lambda involve worse fit.
